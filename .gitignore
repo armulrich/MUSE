@@ -173,8 +173,6 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-*.csv
-
 
 # MAC specific stuff:: macOS metadata files
 .DS_Store
