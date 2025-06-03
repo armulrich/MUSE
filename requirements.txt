@@ -4,6 +4,7 @@ numpy>=1.20
 scipy
 h5py
 matplotlib
-#jupyter
-#ipykernel
+jupyter
+ipykernel
+
 
