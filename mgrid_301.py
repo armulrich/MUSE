@@ -103,9 +103,9 @@ def main():
     zmax    =  0.100000000000000E+000
     pmin    =  0.000000000000000E+000
     pmax    =   6.28318530717959     
-    nr      =         301
-    nz      =         301
-    nphi    =         72
+    nr      =         20 # Originally at 301
+    nz      =         20 # Originally at 301 
+    nphi    =         12 # Originally at 72 -> Reduced these values here to make the computation more workable
     nfp = 2
 
     # generate coordinates
