@@ -9,48 +9,19 @@ from coilpy import rotation_matrix, muse2magntense
 from scipy.constants import mu_0
 
 ### Adding Quick fixes here to enable usage with newever magtense simulation
-def set_tile_type(self, val):
-    self.tile_type = val
-
-def set_size_i(self, size, i):
-    self.size = (size, i)
-
-def set_offset_i(self, offset, i):
-    self.offset = (offset, i)
-
-def set_rotation_i(self, rot, i):
-    self.rot = (rot, i)
-
-def set_remanence_i(self, mrem, i):
-    self.M_rem = (mrem, i)
-
-def set_mu_r_ea_i(self, muea, i):
-    self.mu_r_ea = (muea, i)
-
-def set_mu_r_oa_i(self, muoa, i):
-    self.mu_r_oa = (muoa, i)
-
-def set_mag_angle_i(self, mag_angle, i):
-    self.set_easy_axis(val=mag_angle, idx=i)
-
-def set_color_i(self, color, i):
-    self.color = (color, i)
-
-for name, func in [
-    ("set_tile_type",    set_tile_type),
-    ("set_size_i",       set_size_i),
-    ("set_offset_i",     set_offset_i),
-    ("set_rotation_i",   set_rotation_i),
-    ("set_remanence_i",  set_remanence_i),
-    ("set_mu_r_ea_i",    set_mu_r_ea_i),
-    ("set_mu_r_oa_i",    set_mu_r_oa_i),
-    ("set_mag_angle_i",  set_mag_angle_i),
-    ("set_color_i",      set_color_i),
-]:
-    setattr(_ms.Tiles, name, func)
+def _bind(name, fn): setattr(_ms.Tiles, name, fn)
+_bind("set_tile_type",lambda s,v: setattr(s,"tile_type",v))
+_bind("set_size_i",    lambda s,v,i: s.size.__setitem__((i,),v))
+_bind("set_offset_i",  lambda s,v,i: s.offset.__setitem__((i,),v))
+_bind("set_rotation_i",  lambda s,v,i: s.rot.__setitem__((i,),v))
+_bind("set_remanence_i",lambda s,v,i: s.M_rem.__setitem__((i,),v))
+_bind("set_mu_r_ea_i", lambda s,v,i: s.mu_r_ea.__setitem__((i,),v))
+_bind("set_mu_r_oa_i", lambda s,v,i: s.mu_r_oa.__setitem__((i,),v))
+_bind("set_mag_angle_i",lambda s,v,i: s.set_easy_axis(val=v, idx=i))
+_bind("set_color_i", lambda s,v,i: s.color.__setitem__((i,),v))
+magtense.Tiles = _ms.Tiles
 
 ## Have to access private variables here (again temp fix but I think this should work)
-magtense.Tiles = _ms.Tiles
 magtense.run_simulation = _ms.run_simulation
 
 def updateTiles2FICUS(tiles, fname):
