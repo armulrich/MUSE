@@ -14,6 +14,7 @@ import magtense, magtense.magstatics as _ms
 from magtense.magstatics import get_demag_tensor, get_H_field
 from coilpy import rotation_matrix, muse2magntense
 from scipy.constants import mu_0
+from scipy.optimize import minimize
 
 # For loaing coil fields
 from simsopt.util.permanent_magnet_helper_functions import read_focus_coils
@@ -80,41 +81,27 @@ def labonte_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil
     last_res      = np.inf
 
     for it in range(1, max_it+1):
-        # Update H terms
+
         H_demag = get_H_field(tiles, centres, demag_tensor)
+        H_anis  = anisotropy_field(tiles.M, tiles.u_ea, K, Ms) if not demag_only else np.zeros_like(H_demag)
+        H_coil  = Hcoil_func(centres)                           if not demag_only else np.zeros_like(H_demag)
 
-        # linear |M| adjustment if chi>0 
-        # (note: this is a fix to avoid using magtense iterate magnetization func 
-        # since that currently only supports a couple mu values for soft magnets)
-        if chi>0:
-            m_hat = tiles.M / np.linalg.norm(tiles.M, axis=1, keepdims=True)
-            tiles.M = Ms*m_hat + chi*H_demag
+        # chi‐correction on the internal field H_int = H_demag + H_anis + H_coil
+        if chi > 0:
+            m_hat   = tiles.M / np.linalg.norm(tiles.M, axis=1, keepdims=True)
+            H_int   = H_demag + H_anis + H_coil
+            tiles.M = Ms * m_hat + chi * H_int
+            # must re‐compute H_demag after changing M
             H_demag = get_H_field(tiles, centres, demag_tensor)
-            
 
-        if demag_only:
-            # Adding this for comparison with mgrid-301.py (magstatics)
-            H_anis = np.zeros_like(H_demag)
-            H_coil = np.zeros_like(H_demag)
-        else:
-            H_anis = anisotropy_field(tiles.M, tiles.u_ea, K, Ms)
-            H_coil = Hcoil_func(centres)
+        H_eff = H_demag + H_anis + H_coil
 
-        # now assemble total effective field
-        H_eff = H_demag + H_anis + H_coil 
-        
         norm = np.linalg.norm(H_eff, axis=1, keepdims=True)
         norm[norm < 1e-12] = 1.0
         h_hat = H_eff / norm
 
         m_old  = tiles.M.copy() # Deep copy here
-        
-        v_tilde = m_old + omega * (Ms*h_hat - m_old)                # SOR step
-        tiles.M = v_tilde / np.linalg.norm(v_tilde,axis=1,keepdims=True) * Ms  # re-normalize
-
-        ### RESIDUAL metric ###
-        # residual  (OLD)
-        #res = np.linalg.norm(np.cross(tiles.M, H_eff), axis=1).max() / Ms
+        tiles.M = (1-omega)*m_old + omega*Ms*h_hat # Labonte 
 
         # compute field magnitudes
         h_abs = np.linalg.norm(H_eff, axis=1)
@@ -125,7 +112,7 @@ def labonte_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil
         # clip so nothing is below eps
         h_safe = np.clip(h_abs, eps, None)
         
-        # now the residual is exactly sin(theta)
+        # Using cross product rule....
         res = np.max(
             np.linalg.norm(np.cross(tiles.M, H_eff), axis=1)
             / (Ms * h_safe)
@@ -136,12 +123,13 @@ def labonte_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil
             ## Adding some iter logging
             max_tilt = np.degrees(np.arccos(np.clip(dot,-1,1))).max()
             print(
-                f"iter {it:3d}: residual={res:.2e} | max tilt={max_tilt:6.2f}° "
-                f"| max|H_demag|={np.linalg.norm(H_demag,axis=1).max():.3e} "
-                f"| max|H_anis|={np.linalg.norm(H_anis,axis=1).max():.3e} "
-                f"| max|H_coil|={np.linalg.norm(H_coil,axis=1).max():.3e} "
-                f"| max|H_eff|={np.linalg.norm(H_eff,axis=1).max():.3e}")
-            
+                f"  iter {it:3d}: residual={res:.2e} | max tilt={max_tilt:6.2f}° "
+                f"| max|H_demag|={np.linalg.norm(H_demag,axis=1).max():.2e} "
+                f"| max|H_anis|={np.linalg.norm(H_anis,axis=1).max():.2e} "
+                f"| max|H_coil|={np.linalg.norm(H_coil,axis=1).max():.2e} "
+                f"| max|H_eff|={np.linalg.norm(H_eff,axis=1).max():.2e}")
+
+                    
         # simple stagnation guard (DOUBLE GUARD)
         if res < tol:
             print(f"  converged in {it} iterations (residual={res:.2e})")
@@ -174,7 +162,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--muea",  type=float, default=1.00)
     ap.add_argument("--muoa",  type=float, default=1.00)
-    ap.add_argument("--omega", type=float, default=1.30, help="SOR over-relaxation factor w (≈0.5–1.9)")
+    ap.add_argument("--omega", type=float, default=0.3, help="SOR over-relaxation factor w (≈0.5–1.9)")
     ap.add_argument("--max-it",type=int,   default=50)
     ap.add_argument("--tol",   type=float, default=1e-4)
     ap.add_argument("--Hcoil", nargs=3, type=float, default=[0,0,0], metavar=("Hx","Hy","Hz"), help="Uniform coil field components A/m") 
