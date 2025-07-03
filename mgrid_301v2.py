@@ -74,7 +74,9 @@ def coil_field_at(pts, const_H, use_coils, bs_coil: BiotSavart):
     H = np.broadcast_to(const_H, (N,3)).copy()
     return H
 
-# Inspired by MUSE magstatics run simulation fortran code
+# Inspired by MUSE magstatics run simulation -> Iterate Magnet Solution (hard case) fortran code 
+# LINK:https://github.com/cmt-dtu-energy/MagTense/blob/0dbf1442170fd734e73496e3af458bd0e3b2d8ef/source/DemagField/DemagField/IterateMagnetSolution.f90#L32
+
 def sor_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil_func, log_every, demag_only=False):
     lambda_ = float(1.0)
     H_prev  = np.zeros((tiles.n, 3), **_F64)
