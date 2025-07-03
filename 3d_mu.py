@@ -1,127 +1,164 @@
-import argparse
+"""
+Generate VTK glyphs for permanent‐magnet dipole fields and optional ΔBn, Δ|B|, Δθ maps.
+"""
 from pathlib import Path
+import argparse
 import numpy as np
 from simsopt.field import DipoleField
 from simsopt.geo import SurfaceRZFourier, Surface
 from coilpy import muse2magntense
-import magtense, magtense.magstatics as _ms
-def _bind(name, fn): setattr(_ms.Tiles, name, fn)
-_bind("set_tile_type",lambda s,v: setattr(s,"tile_type",v))
-_bind("set_size_i",    lambda s,v,i: s.size.__setitem__((i,),v))
-_bind("set_offset_i",  lambda s,v,i: s.offset.__setitem__((i,),v))
-_bind("set_rotation_i",  lambda s,v,i: s.rot.__setitem__((i,),v))
-_bind("set_remanence_i",lambda s,v,i: s.M_rem.__setitem__((i,),v))
-_bind("set_mu_r_ea_i", lambda s,v,i: s.mu_r_ea.__setitem__((i,),v))
-_bind("set_mu_r_oa_i", lambda s,v,i: s.mu_r_oa.__setitem__((i,),v))
-_bind("set_mag_angle_i",lambda s,v,i: s.set_easy_axis(val=v, idx=i))
-_bind("set_color_i", lambda s,v,i: s.color.__setitem__((i,),v))
+import magtense.magstatics as _ms
+import magtense  # ensure Tiles fixes
+
+# maintain CoilPy→MagTense compatibility
+def _bind(name, fn):
+    setattr(_ms.Tiles, name, fn)
+
+_bind("set_tile_type",   lambda s, v    : setattr(s, "tile_type", v))
+_bind("set_size_i",      lambda s, v, i : s.size.__setitem__((i,), v))
+_bind("set_offset_i",    lambda s, v, i : s.offset.__setitem__((i,), v))
+_bind("set_rotation_i",  lambda s, v, i : s.rot.__setitem__((i,), v))
+_bind("set_remanence_i", lambda s, v, i : s.M_rem.__setitem__((i,), v))
+_bind("set_mu_r_ea_i",   lambda s, v, i : s.mu_r_ea.__setitem__((i,), v))
+_bind("set_mu_r_oa_i",   lambda s, v, i : s.mu_r_oa.__setitem__((i,), v))
+_bind("set_mag_angle_i", lambda s, v, i : s.set_easy_axis(val=v, idx=i))
+_bind("set_color_i",     lambda s, v, i : s.color.__setitem__((i,), v))
 magtense.Tiles = _ms.Tiles
 
-####
-# Generate 3D VTK visualizations of dipole fields and "optionally" compare (using flags) two different μ‐values.
-#
-# Modes:
-# - Single‐μ mode (default):  Produce a .vtu glyph file of the dipole field for the given μ.
-# - Comparison mode (if --ref-muea or--ref-muoa are supplied):  
-# In addition to the single‐μ mode output also:
-#    – export the reference‐μ glyph,
-#    – compute and write Δ|B| on the plasma surface (.vtu),
-#    – compute per‐magnet Δθ of M vectors and write as a .vtp heat map.
-####
+def csv_brick_volumes(csv_path: Path) -> np.ndarray:
+    # Not sure about htis part
+    # read half-lengths (cols 3–5) from MagTense CSV to compute volumes (I think)
+    data = np.loadtxt(csv_path, delimiter=",", skiprows=1)
+    hlw = data[:, 3:6]
+    return 8.0 * np.prod(hlw, axis=1)
 
-def write_vertex_vtp(pts, values, name, out_path):
+def magnetisation_to_moment(M: np.ndarray, hlw: np.ndarray) -> np.ndarray:
+    vol = 8.0 * np.prod(hlw, axis=1)
+    return M * vol[:, None]
+
+def write_vertex_vtp(pts, vals, name, fname):
     n = len(pts)
-    with open(out_path, "w") as f:
-        f.write('<?xml version="1.0"?>\n<VTKFile type="PolyData" version="0.1" byte_order="LittleEndian">\n')
-        f.write(f' <PolyData>\n  <Piece NumberOfPoints="{n}" NumberOfVerts="{n}">\n')
-        f.write('   <Verts>\n    <DataArray type="Int32" Name="connectivity" format="ascii">\n')
-        f.write(" ".join(map(str, range(n))) + "\n    </DataArray>\n")
-        f.write('    <DataArray type="Int32" Name="offsets" format="ascii">\n')
-        f.write(" ".join(str(i+1) for i in range(n)) + "\n    </DataArray>\n   </Verts>\n")
-        f.write('   <Points>\n    <DataArray type="Float64" NumberOfComponents="3" format="ascii">\n')
-        for x,y,z in pts:
-            f.write(f"     {x:.8e} {y:.8e} {z:.8e}\n")
-        f.write("    </DataArray>\n   </Points>\n")
-        f.write(f'   <PointData Scalars="{name}">\n<DataArray type="Float64" Name="{name}" format="ascii">\n')
-        for v in values:
-            f.write(f"     {v:.8e}\n")
-        f.write("    </DataArray>\n   </PointData>\n")
-        f.write("  </Piece>\n </PolyData>\n</VTKFile>\n")
+    with open(fname, "w") as f:
+        f.write(
+            '<?xml version="1.0"?>\n'
+            '<VTKFile type="PolyData" byte_order="LittleEndian">\n'
+            f' <PolyData>\n  <Piece NumberOfPoints="{n}" NumberOfVerts="{n}">\n'
+            '   <Verts>\n'
+            '    <DataArray type="Int32" Name="connectivity" format="ascii">\n'
+            + " ".join(map(str, range(n))) +
+            "\n    </DataArray>\n"
+            '    <DataArray type="Int32" Name="offsets" format="ascii">\n'
+            + " ".join(str(i+1) for i in range(n)) +
+            "\n    </DataArray>\n"
+            '   </Verts>\n'
+            '   <Points>\n'
+            '    <DataArray type="Float64" NumberOfComponents="3" format="ascii">\n')
+        for x, y, z in pts:
+            f.write(f"{x:.10e} {y:.10e} {z:.10e}\n")
+        f.write(
+            "</DataArray>\n   </Points>\n"
+            f'<PointData Scalars="{name}">\n'
+            '<DataArray type="Float64" Name="' + name +
+            '" format="ascii">\n')
+        for v in vals:
+            f.write(f"{v:.10e}\n")
+        f.write(
+            "</DataArray>\n   </PointData>\n"
+            "</Piece>\n </PolyData>\n</VTKFile>\n")
+
+def write_surface_deltaBn(surf, B1, B2, ntheta, nphi, fname, label):
+    normals = surf.unitnormal().reshape(-1, 3)
+    delta = np.einsum("ij,ij->i", B1 - B2, normals).reshape((ntheta, nphi)).T[:, :, None]
+    surf.to_vtk(fname, extra_data={label: delta})
+    print(f"Wrote {fname} | max‖{label}‖ = {np.abs(delta).max():.3e} T")
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--muea",  type=float, required=True)
-    p.add_argument("--muoa",  type=float, required=True)
-    p.add_argument("--ref-muea", type=float) # -> If comparison mode
-    p.add_argument("--ref-muoa", type=float)
-    p.add_argument("--surface-file", default="./scripts/launch/input.5pga19")
-    p.add_argument("--ntheta",type=int, default=28) # Using these default values from previous MUSE code
-    p.add_argument("--nphi", type=int, default=49)
+    p.add_argument("--muea",          type=float, required=True)
+    p.add_argument("--muoa",          type=float, required=True)
+    p.add_argument("--ref-muea",      type=float)
+    p.add_argument("--ref-muoa",      type=float)
+    p.add_argument("--surface-file",  default="./scripts/launch/input.5pga19")
+    p.add_argument("--ntheta",        type=int, default=28)
+    p.add_argument("--nphi",          type=int, default=49)
+    p.add_argument("--add-ficus-comparison", action="store_true")
+    p.add_argument(
+        "--csv-file",
+        default="./Input/magtense_zot80_3d.csv",
+        help="path to original MagTense CSV for brick geometry"
+    )
     args = p.parse_args()
 
-    single = (args.ref_muea is None or args.ref_muoa is None)
+    single = args.ref_muea is None or args.ref_muoa is None
     tag = f"{args.muea:.2f}_{args.muoa:.2f}"
-    ref_tag = f"{args.ref_muea:.2f}_{args.ref_muoa:.2f}" if not single else None
+    ref_tag = None if single else f"{args.ref_muea:.2f}_{args.ref_muoa:.2f}"
 
-    intermediate = Path("Intermediate")
-    out_dir = Path("Output")
-    out_dir.mkdir(exist_ok=True)
+    out = Path("Output")
+    out.mkdir(exist_ok=True)
 
-    tiles_new = np.load(intermediate / f"Tiles_{tag}.npy", allow_pickle=True).item()
-    xyz, m_new = tiles_new.offset, tiles_new.M
-    b_new = DipoleField(xyz, m_new.ravel(), nfp=2, coordinate_flag="cartesian") 
-    #Not 100% sure if cartesian is the right flag here but ouput seems correct
+    vols = csv_brick_volumes(Path(args.csv_file))
+    tiles_new = np.load(Path("Intermediate") / f"Tiles_{tag}.npy", allow_pickle=True).item()
+    SLICE_T = 1.5875e-3
+    xyz = tiles_new.offset.copy()
+    hlw_tiles = tiles_new.size / 2.0
+    vol_slice = (2 * hlw_tiles[:, 0]) * (2 * hlw_tiles[:, 1]) * SLICE_T
+    m_new = tiles_new.M * vol_slice[:, None]
 
-    surface = SurfaceRZFourier.from_vmec_input(
+    b_new = DipoleField(xyz, m_new.ravel(), nfp=2, coordinate_flag="cartesian")
+    surf = SurfaceRZFourier.from_vmec_input(
         Path(args.surface_file),
         range=Surface.RANGE_FULL_TORUS,
-        nphi=args.nphi, ntheta=args.ntheta
+        ntheta=args.ntheta,
+        nphi=args.nphi
     )
-    pts = surface.gamma().reshape(-1,3)
+    pts = surf.gamma().reshape(-1, 3)
 
-    # SIDE STEP: also dump the original (pre-iteration) dipoles from the FICUS input
-    tiles_orig = muse2magntense("./Input/magtense_zot80_3d.csv",magnetization=1.1658e6,mu=[args.ref_muea, args.ref_muoa])
-    xyz0, m0 = tiles_orig.offset, tiles_orig.M
-    b_orig    = DipoleField(xyz0, m0.ravel(), nfp=2, coordinate_flag="cartesian")
-    b_orig.set_points(pts)
-    out0 = out_dir / "dipoles_original.vtu"
-    b_orig._toVTK(out0)
-    print("Wrote", out0)
-
-    # Contiun
-    out1 = out_dir / f"dipoles_mu_{tag}.vtu"
     b_new.set_points(pts)
-    b_new._toVTK(out1)
-    print("Wrote",out1)
+    b_new._toVTK(out / f"dipoles_mu_{tag}")
+    print(f"Wrote dipoles_mu_{tag}")
 
     if not single:
-
-        tiles_ref = np.load(intermediate / f"Tiles_{ref_tag}.npy", allow_pickle=True).item()
-        m_ref     = tiles_ref.M
-        b_ref     = DipoleField(xyz, m_ref.ravel(), nfp=2, coordinate_flag="cartesian")
-        out2 = out_dir / f"dipoles_mu_{ref_tag}.vtu"
+        tiles_ref = np.load(Path("Intermediate") / f"Tiles_{ref_tag}.npy", allow_pickle=True).item()
+        m_ref = magnetisation_to_moment(tiles_ref.M, hlw_tiles)
+        b_ref = DipoleField(xyz, m_ref.ravel(), nfp=2, coordinate_flag="cartesian")
         b_ref.set_points(pts)
-        b_ref._toVTK(out2)
-        print("Wrote",out2)
+        b_ref._toVTK(out / f"dipoles_mu_{ref_tag}")
 
-        B_new = b_new.B(); B_ref = b_ref.B()
-        mag_new = np.linalg.norm(B_new,axis=1)
-        mag_ref = np.linalg.norm(B_ref,axis=1)
-        deltaB = (mag_new - mag_ref).reshape((args.ntheta,args.nphi)).T[:,:,None]
-        out3 = out_dir / f"surface_deltaB_mu_{tag}.vtu"
-        surface.to_vtk(out3, extra_data={"ΔB": deltaB})
-        print("Wrote",out3)
+        Bn, Br = b_new.B(), b_ref.B()
+        dB = (np.linalg.norm(Bn, axis=1) - np.linalg.norm(Br, axis=1))
+        dB = dB.reshape((args.ntheta, args.nphi)).T[:, :, None]
+        surf.to_vtk(out / f"surface_deltaB_mu_{tag}", extra_data={"Δ|B|": dB})
+        print(f"Wrote surface_deltaB_mu_{tag}")
 
-        dot = np.einsum('ij,ij->i', m_new, m_ref) # inner product
-        norms = np.linalg.norm(m_new,axis=1)*np.linalg.norm(m_ref,axis=1)
-        norms = np.where(norms>1e-12, norms,1.0)
-        deltaθ = np.degrees(np.arccos(np.clip(dot/norms,-1,1)))
-        out4 = out_dir / f"magnet_delta_theta_mu_{tag}.vtp"
-        write_vertex_vtp(xyz, deltaθ, "delta_theta_deg", out4)
-        print("Wrote", out4)
+        dot = np.einsum("ij,ij->i", tiles_new.M, tiles_ref.M)
+        # Compute norms per tile (axis=1) instead of global flatten
+        norms_new = np.linalg.norm(tiles_new.M, axis=1) # per‐row 2‐norm
+        norms_ref = np.linalg.norm(tiles_ref.M, axis=1) # per‐row 2‐norm
+        norm_prod = norms_new * norms_ref # elementwise product
 
-    mode = "single-mu" if single else "comparison"
-    print(f"Finished ({mode} mode). Outputs in {out_dir}")
+        # FIX: avoid division by zero
+        norm_prod[norm_prod < 1e-12] = 1.0
+        dtheta = np.degrees(np.arccos(np.clip(dot / norm_prod, -1, 1)))
+        write_vertex_vtp(xyz, dtheta, "delta_theta_deg", out / f"magnet_delta_theta_mu_{tag}.vtp")
+        print(f"Wrote magnet_delta_theta_mu_{tag}")
 
-if __name__=="__main__":
+    if args.add_ficus_comparison:
+        dat = np.loadtxt(args.csv_file, delimiter=",", skiprows=1)
+        hlw_csv = dat[:, 3:6]
+        m_fic = (dat[:, 11, None] * dat[:, 12:15]).ravel()
+        b_fic = DipoleField(dat[:, :3], m_fic, nfp=2, coordinate_flag="cartesian")
+        b_fic.set_points(pts)
+        write_surface_deltaBn(
+            surf,
+            b_new.B(),
+            b_fic.B(),
+            args.ntheta,
+            args.nphi,
+            out / (f"surface_deltaBn_SORminusFICUS_{tag}"),
+            "ΔBn"
+        )
+
+    print("Finished; outputs in", out)
+
+if __name__ == "__main__":
     main()
