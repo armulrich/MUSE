@@ -1,5 +1,5 @@
 """
-Micromagnetic LaBonte–SOR sweep for the 9 736 Nd–Fe–B blocks in
+Micromagnetic SOR sweep for the 9 736 Nd–Fe–B blocks in
     ./Input/magtense_zot80_3d.csv
 
 Field terms at every tile centre
@@ -74,9 +74,8 @@ def coil_field_at(pts, const_H, use_coils, bs_coil: BiotSavart):
     H = np.broadcast_to(const_H, (N,3)).copy()
     return H
 
-## Labonte: accelerated iteration (note that I am recommputing the H terms at each iterate)
-# Adopted this from "A Numerical Study of LaBonte’s Iteration: An Approach to Acceleration" (Kosavisutte, Hayaslii, 1996)
-def labonte_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil_func, log_every, demag_only=False):
+# Inspired by MUSE magstatics run simulation fortran code
+def sor_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil_func, log_every, demag_only=False):
     lambda_ = float(1.0)
     H_prev  = np.zeros((tiles.n, 3), **_F64)
     M_prev = None
@@ -98,9 +97,6 @@ def labonte_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil
         # H_anis = anisotropy_field(tiles.M, u, K, Ms) if not demag_only else np.zeros_like(H_demag) 
         H_coil  = Hcoil_func(centres).astype(np.float64)                if not demag_only else np.zeros_like(H_demag).astype(np.float64)
         H_eff   = H_demag + H_anis + H_coil
-
-        H_chi   = (chi_par * H_par) + (chi_perp * H_perp)
-        H_eff_true = H_eff - H_chi
 
         # successive over-relaxation
         H_prev = H_prev + lambda_ * (H_eff - H_prev)
@@ -211,9 +207,9 @@ def main():
     
     # Step 2. Iteration until Browns 1st Eqn. Is satisfied 
     t0 = time.perf_counter()
-    tiles = labonte_sweep(tiles,centres, demag_tensor,Ms,K,args.omega,args.max_it,args.tol,Hcoil_func,log_every=5, demag_only=args.demag_only)
+    tiles = sor_sweep(tiles,centres, demag_tensor,Ms,K,args.omega,args.max_it,args.tol,Hcoil_func,log_every=5, demag_only=args.demag_only)
     t1 = time.perf_counter()
-    print(f"\nTotal LaBonte-Accelerated iteration time: {t1-t0:.2f} s\n")
+    print(f"\nTotal SOR iteration time: {t1-t0:.2f} s\n")
 
     np.save(f"Intermediate/Tiles_{tag}.npy", tiles)
     print(f"→  Intermediate/Tiles_{tag}.npy written")
