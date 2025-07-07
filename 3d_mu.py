@@ -69,7 +69,8 @@ def write_surface_deltaBn(surf, B1, B2, ntheta, nphi, fname, label):
     print(f"Wrote {fname} | max‖{label}‖ = {np.abs(delta).max():.3e} T")
     print("max|B_ficus| =", np.linalg.norm(B2,axis=1).max())
     print("max|B_SOR|   =", np.linalg.norm(B1, axis=1).max())
-
+    rel = np.abs(delta).max() / np.linalg.norm(B2, axis=1).max()
+    print(f"max|ΔBn| / max|B_ficus| = {rel:.2%}")
 
 def main():
     p = argparse.ArgumentParser()
@@ -141,10 +142,19 @@ def main():
         print(f"Wrote magnet_delta_theta_mu_{tag}")
 
     if args.add_ficus_comparison:
-        dat = np.loadtxt(args.csv_file, delimiter=",", skiprows=1)
-        hlw_csv = dat[:, 3:6]
-        m_fic = (dat[:, 11, None] * dat[:, 12:15]).ravel()
-        b_fic = DipoleField(dat[:, :3], m_fic, nfp=2, coordinate_flag="cartesian")
+        tiles_fic = muse2magntense(
+            "./Input/magtense_zot80_3d.csv",
+            magnetization=1.1658e6,
+            mu=[1.00, 1.00]
+        )
+        
+        m_fic = tiles_fic.M * vol_slice[:, None]
+        
+        b_fic = DipoleField(
+            xyz,
+            m_fic.ravel(),
+            nfp=2, coordinate_flag="cartesian"
+        )
         b_fic.set_points(pts)
         write_surface_deltaBn(
             surf,
