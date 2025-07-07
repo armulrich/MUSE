@@ -1,6 +1,3 @@
-"""
-Generate VTK glyphs for permanent‐magnet dipole fields and optional ΔBn, Δ|B|, Δθ maps.
-"""
 from pathlib import Path
 import argparse
 import numpy as np
@@ -8,9 +5,8 @@ from simsopt.field import DipoleField
 from simsopt.geo import SurfaceRZFourier, Surface
 from coilpy import muse2magntense
 import magtense.magstatics as _ms
-import magtense  # ensure Tiles fixes
+import magtense  
 
-# maintain CoilPy→MagTense compatibility
 def _bind(name, fn):
     setattr(_ms.Tiles, name, fn)
 
@@ -71,6 +67,9 @@ def write_surface_deltaBn(surf, B1, B2, ntheta, nphi, fname, label):
     delta = np.einsum("ij,ij->i", B1 - B2, normals).reshape((ntheta, nphi)).T[:, :, None]
     surf.to_vtk(fname, extra_data={label: delta})
     print(f"Wrote {fname} | max‖{label}‖ = {np.abs(delta).max():.3e} T")
+    print("max|B_ficus| =", np.linalg.norm(B2,axis=1).max())
+    print("max|B_SOR|   =", np.linalg.norm(B1, axis=1).max())
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -136,7 +135,6 @@ def main():
         norms_ref = np.linalg.norm(tiles_ref.M, axis=1) # per‐row 2‐norm
         norm_prod = norms_new * norms_ref # elementwise product
 
-        # FIX: avoid division by zero
         norm_prod[norm_prod < 1e-12] = 1.0
         dtheta = np.degrees(np.arccos(np.clip(dot / norm_prod, -1, 1)))
         write_vertex_vtp(xyz, dtheta, "delta_theta_deg", out / f"magnet_delta_theta_mu_{tag}.vtp")
