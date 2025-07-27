@@ -22,7 +22,6 @@ _bind("set_color_i",     lambda s, v, i : s.color.__setitem__((i,), v))
 magtense.Tiles = _ms.Tiles
 
 def csv_brick_volumes(csv_path: Path) -> np.ndarray:
-    # Not sure about htis part
     # read half-lengths (cols 3–5) from MagTense CSV to compute volumes (I think)
     data = np.loadtxt(csv_path, delimiter=",", skiprows=1)
     hlw = data[:, 3:6]
@@ -62,15 +61,29 @@ def write_vertex_vtp(pts, vals, name, fname):
             "</DataArray>\n   </PointData>\n"
             "</Piece>\n </PolyData>\n</VTKFile>\n")
 
-def write_surface_deltaBn(surf, B1, B2, ntheta, nphi, fname, label):
+
+def write_surface_deltaBn(surf, ntheta, nphi, fname, B_target=None, B_ficus=None):
+    """
+    Export Δ(B·n) on the given surface to VTK and print max relative error
+    (normalized by a standrad value of 0.15 T)
+    """
+    
+    if B_target is None or B_ficus is None:
+        raise ValueError("B_target and B_ficus must be provided")
+
     normals = surf.unitnormal().reshape(-1, 3)
-    delta = np.einsum("ij,ij->i", B1 - B2, normals).reshape((ntheta, nphi)).T[:, :, None]
-    surf.to_vtk(fname, extra_data={label: delta})
-    print(f"Wrote {fname} | max‖{label}‖ = {np.abs(delta).max():.3e} T")
-    print("max|B_ficus| =", np.linalg.norm(B2,axis=1).max())
-    print("max|B_SOR|   =", np.linalg.norm(B1, axis=1).max())
-    rel = np.abs(delta).max() / np.linalg.norm(B2, axis=1).max()
-    print(f"max|ΔBn| / max|B_ficus| = {rel:.2%}")
+
+    # delta Bn at every surface point
+    delta = np.einsum("ij,ij->i", B_target - B_ficus, normals)
+    delta = delta.reshape((ntheta, nphi)).T[:, :, None]
+
+    surf.to_vtk(fname, extra_data={"ΔBn": delta})
+    print(f"Wrote {fname} | max‖ΔBn‖ = {np.abs(delta).max():.3e} T")
+
+    # Pointwise relative error
+    rel = (np.abs(delta) / 0.15).max()  # Using 0.15 a standard value
+    print(f"max(‖ΔBn‖/0.15) = {rel:.2%}")
+    
 
 def main():
     p = argparse.ArgumentParser()
@@ -96,15 +109,13 @@ def main():
     out = Path("Output")
     out.mkdir(exist_ok=True)
 
-    vols = csv_brick_volumes(Path(args.csv_file))
     tiles_new = np.load(Path("Intermediate") / f"Tiles_{tag}.npy", allow_pickle=True).item()
-    SLICE_T = 1.5875e-3
     xyz = tiles_new.offset.copy()
     hlw_tiles = tiles_new.size / 2.0
-    vol_slice = (2 * hlw_tiles[:, 0]) * (2 * hlw_tiles[:, 1]) * SLICE_T
-    m_new = tiles_new.M * vol_slice[:, None]
 
+    m_new = magnetisation_to_moment(tiles_new.M, hlw_tiles)
     b_new = DipoleField(xyz, m_new.ravel(), nfp=2, coordinate_flag="cartesian")
+
     surf = SurfaceRZFourier.from_vmec_input(
         Path(args.surface_file),
         range=Surface.RANGE_FULL_TORUS,
@@ -123,6 +134,7 @@ def main():
         b_ref = DipoleField(xyz, m_ref.ravel(), nfp=2, coordinate_flag="cartesian")
         b_ref.set_points(pts)
         b_ref._toVTK(out / f"dipoles_mu_{ref_tag}")
+        print(f"Wrote dipoles_mu_{ref_tag}")
 
         Bn, Br = b_new.B(), b_ref.B()
         dB = (np.linalg.norm(Bn, axis=1) - np.linalg.norm(Br, axis=1))
@@ -148,23 +160,17 @@ def main():
             mu=[1.00, 1.00]
         )
         
-        m_fic = tiles_fic.M * vol_slice[:, None]
-        
-        b_fic = DipoleField(
-            xyz,
-            m_fic.ravel(),
-            nfp=2, coordinate_flag="cartesian"
-        )
+        m_fic = magnetisation_to_moment(tiles_fic.M, hlw_tiles)
+        b_fic = DipoleField(xyz, m_fic.ravel(), nfp=2, coordinate_flag="cartesian")
         b_fic.set_points(pts)
         write_surface_deltaBn(
-            surf,
-            b_new.B(),
-            b_fic.B(),
-            args.ntheta,
-            args.nphi,
-            out / (f"surface_deltaBn_SORminusFICUS_{tag}"),
-            "ΔBn"
-        )
+        surf,
+        args.ntheta,
+        args.nphi,
+        out / f"surface_deltaBn_SORminusFICUS_{tag}",
+        B_target=b_new.B(),
+        B_ficus=b_fic.B())
+
 
     print("Finished; outputs in", out)
 

@@ -1,24 +1,22 @@
-"""
-Micromagnetic SOR sweep for the 9 736 Nd–Fe–B blocks in
-    ./Input/magtense_zot80_3d.csv
-
-Field terms at every tile centre
-  H_demag   – MagTense (all dipolar interactions,incl. self)
-  H_anis   – 2K/(μ0 Ms²) (m·u) u (uniaxial)
-  H_coil    – coil field (default,0)
-"""
 from pathlib import Path
 import argparse, numpy as np
 import time
+import copy
 import magtense, magtense.magstatics as _ms
 from magtense.magstatics import get_demag_tensor, get_H_field
 from coilpy import rotation_matrix, muse2magntense
 from scipy.constants import mu_0
 from scipy.optimize import minimize
+from scipy.linalg import cholesky, solve_triangular, LinAlgError, svd, norm, solve
+from scipy.sparse import csc_matrix
+from scipy.sparse.linalg import svds, minres, gmres, LinearOperator
 
 # For loaing coil fields
 from simsopt.util.permanent_magnet_helper_functions import read_focus_coils
 from simsopt.field import Coil, BiotSavart
+
+# LA - Directsolve Test
+import scipy.linalg as _la
 
 ## Creating new float type
 _F64 = dict(dtype=np.float64)
@@ -52,6 +50,7 @@ def load_coil_BiotSavart(path: Path) -> BiotSavart:
     return bs
 
 ## field helper funcs
+# todo: remove this since macromagnetic model + device scale magnets don't need anisostropic term
 def anisotropy_field(M, u_ea, K, Ms):
     """
     Local uniaxial anisotropy
@@ -63,7 +62,7 @@ def anisotropy_field(M, u_ea, K, Ms):
 
 def coil_field_at(pts, const_H, use_coils, bs_coil: BiotSavart):
     """
-    Return H (A m⁻¹).  If TF-coils are requested we evaluate the Biot–Savart
+    Return H (A m⁻¹).  If TF-coils are requested we evaluate the Biot Savart
     field with SIMSOPT; otherwise we fall back to a user-supplied uniform H.
     """
     if use_coils and bs_coil is not None:
@@ -143,6 +142,130 @@ def sor_sweep(tiles, centres, demag_tensor, Ms, K, omega, max_it, tol, Hcoil_fun
     return tiles
 
 
+# Used this for more comprehensive direct solve which included logging of different methods will remove this but wanted to add this git history
+def magstatics_direct_solve_v1(tiles, centres, demag_tensor, ms, k, Hcoil_func, demag_only=False, krylov_tol=1e-8, krylov_it=200):
+    n = tiles.n
+    u = tiles.u_ea
+    chi_pa = tiles.mu_r_ea - 1
+    chi_pe = tiles.mu_r_oa - 1
+    m_rem  = tiles.M_rem
+    chi = np.empty((n, 3, 3), **_F64)
+    for i in range(n):
+        uuT = np.outer(u[i], u[i])
+        chi[i] = chi_pa[i]*uuT + chi_pe[i]*(np.eye(3) - uuT)
+
+    H_a = Hcoil_func(centres).astype(np.float64) if not demag_only else np.zeros((n, 3))
+    b   = np.vstack([m_rem[i]*u[i] + chi[i] @ H_a[i] for i in range(n)]).ravel()
+
+    N3 = 3*n
+    A  = np.zeros((N3, N3), **_F64)
+    I3 = np.eye(3)
+    for i in range(n):
+        r = slice(3*i, 3*i+3)
+        # assembling dense system matrix...
+        # demag_tensor holds –NM, so I – chi_i @ demag_tensor = I + chi_i @ NM (which is what we want)
+        A[r, r] = I3 - chi[i] @ demag_tensor[i, i]
+        for j in range(n):
+            if i == j:
+                continue
+            c = slice(3*j, 3*j+3)
+            A[r, c] = -chi[i] @ demag_tensor[i, j]
+    nnz = (A !=0).sum()
+    density = nnz / (N3*N3)
+    sym = np.allclose(A, A.T, atol=1e-12, rtol=1e-10)
+
+    #  iterative sparse SVD only if it's really sparse and large... 
+    if density <= 0.10:
+        s_min = svds(csc_matrix(A), k=1, which='SM', return_singular_vectors=False)[0]
+        s_max = svds(csc_matrix(A), k=1, which='LM', return_singular_vectors=False)[0]
+    else:
+        s = svd(A, compute_uv=False)
+        s_min, s_max = s[-1], s[0]
+    print(f"density {density:.2%}, condition numbe = {s_max/s_min:.2e}, sym: {sym}")
+
+    x = None
+    spd = False
+    if sym:
+        try:
+            t0 = time.perf_counter()
+            L = cholesky(A, lower=True, check_finite=False)
+            spd = True
+            y = solve_triangular(L, b, lower=True, check_finite=False)
+            x = solve_triangular(L.T, y,lower=False,check_finite=False)
+            err_fact = norm(A - L @ L.T) / norm(A)
+            print(f"Chol {time.perf_counter()-t0:.2f}s, res {norm(A@x-b)/norm(b):.2e}, LLT err {err_fact:.2e}")
+        except LinAlgError:
+            pass
+    if x is None:
+        t0 = time.perf_counter()
+        x  = solve(A, b, assume_a='gen')
+        print(f"LU {time.perf_counter()-t0:.2f}s, res {norm(A@x-b)/norm(b):.2e}")
+    linop = LinearOperator(A.shape, matvec=lambda v: A@v, rmatvec=lambda v: A.T@v)
+    if sym:
+        t0 = time.perf_counter()
+        xk, info = minres(linop, b, tol=krylov_tol, maxiter=krylov_it)
+        print(f"MINRES {time.perf_counter()-t0:.2f}s, res {norm(A@xk-b)/norm(b):.2e}, info {info}")
+    else:
+        t0 = time.perf_counter()
+        xk, info = gmres(linop, b, maxiter=krylov_it)
+        print(f"GMRES  {time.perf_counter()-t0:.2f}s, res {norm(A@xk-b)/norm(b):.2e}, info {info}")
+
+    tiles.M = x.reshape(n, 3)
+    return tiles
+
+
+def construct_A(n, chi, demag_tensor):
+    N3 = 3*n
+    A  = np.zeros((N3, N3), **_F64)
+    I3 = np.eye(3)
+    for i in range(n):
+ 
+        mats = -np.einsum('pr,jrq->jpq', chi[i], demag_tensor[i], optimize=True)
+        mats[i] += I3
+        r = slice(3*i, 3*i+3)
+        for j in range(n):
+            c = slice(3*j, 3*j+3)
+            A[r, c] = mats[j]
+    return A
+
+def construct_b(n, m_rem, u, chi, H_a):
+    return np.vstack([m_rem[i]*u[i] + chi[i] @ H_a[i] for i in range(n)]).ravel()
+
+def magstatics_direct_solve(tiles, centres, demag_tensor, ms, k, Hcoil_func, demag_only=False,krylov_tol=1e-3, krylov_it=200):
+    n      = tiles.n
+    u      = tiles.u_ea
+    chi_pa = tiles.mu_r_ea - 1
+    chi_pe = tiles.mu_r_oa - 1
+    m_rem  = tiles.M_rem
+
+    chi = np.empty((n, 3, 3), **_F64)
+    for i in range(n):
+        uuT    = np.outer(u[i], u[i])
+        chi[i] = chi_pa[i]*uuT + chi_pe[i]*(np.eye(3) - uuT)
+
+    H_a = Hcoil_func(centres).astype(np.float64) if not demag_only else np.zeros((n, 3))
+    b   = construct_b(n, m_rem, u, chi, H_a)
+    A  = construct_A(n, chi, demag_tensor)
+    
+    sym = np.allclose(A, A.T, atol=1e-12, rtol=1e-10)
+    print(f"symmetry check: {sym}")
+
+    linop = LinearOperator(A.shape, matvec=lambda v: A @ v,
+                                      rmatvec=lambda v: A.T @ v)
+
+    if sym:
+        x, info = minres(linop, b, rtol=krylov_tol, maxiter=krylov_it)
+        print(f"MINRES   res  {norm(A@x-b)/norm(b):.2e}, info {info}")
+    else:
+        x, info = gmres( linop, b, rtol=krylov_tol, maxiter=krylov_it )
+        print(f"GMRES    res  {norm(A@x-b)/norm(b):.2e}, info {info}")
+
+
+    tiles.M = x.reshape(n, 3)
+    return tiles
+
+
+
 def export_ficus_csv(tiles, fname):
     n = tiles.n
     out = np.zeros((n,15))
@@ -168,6 +291,8 @@ def main():
     ap.add_argument("--use-coils",action="store_true",help="add TF-coil field with FICUS analytic model")
     ap.add_argument("--demag-only", action="store_true", help="only include H_demag (zero out H_anis and H_coil)")
     ap.add_argument("--coil-file",type=Path,help="numpy .npy or csv with columns x y z nx ny nz I a " "(ignored unless --use-coils)")
+    ap.add_argument("--solver", choices=["direct","sor","compare"], default="direct", help="Which magnetostatic solver to run (default: direct)")
+
     args = ap.parse_args()
 
     tag = f"{args.muea:.2f}_{args.muoa:.2f}"
@@ -177,13 +302,8 @@ def main():
     # Step 1. Loadding magnets and coils.... (from completed ficus optimization)
     # Extra note used magnetization as defined in def muse2magntense(muse_file, mu=(1.05, 1.05), magnetization=1.16e6, **kwargs): source code
     # Link: https://zhucaoxiang.github.io/CoilPy/_modules/coilpy/magtense_interface.html#muse2magntense
-    tiles = muse2magntense("./Input/magtense_zot80_3d.csv", magnetization=1.1658e6, mu=[args.muea, args.muoa])
-    
-    #tiles.magnet_type[:] = 3  #3 = soft + constant μ_r
-    #  Note: I think this has no effect and will internally be treated as 1->hard since we do not invoke iterate magnizaton. 
-    
+    tiles = muse2magntense("./Input/magtense_zot80_3d.csv", magnetization=1.1658e6, mu=[args.muea, args.muoa])    
     tiles.mu_r_ea, tiles.mu_r_oa = args.muea, args.muoa
-
     centres = tiles.offset.copy()
 
     # Using values from one of the magtense papers (Rasmus, Roberto 2023) 
@@ -208,9 +328,61 @@ def main():
     
     # Step 2. Iteration until Browns 1st Eqn. Is satisfied 
     t0 = time.perf_counter()
-    tiles = sor_sweep(tiles,centres, demag_tensor,Ms,K,args.omega,args.max_it,args.tol,Hcoil_func,log_every=5, demag_only=args.demag_only)
+    if args.solver == "sor":
+        tiles = sor_sweep(
+            tiles, centres, demag_tensor,
+            Ms, K,
+            omega=args.omega,
+            max_it=args.max_it,
+            tol=args.tol,
+            Hcoil_func=Hcoil_func,
+            log_every=5,
+            demag_only=args.demag_only
+        )
+        solver_name = "SOR"
+    elif args.solver == "direct":
+        tiles = magstatics_direct_solve(
+            tiles, centres, demag_tensor,
+            Ms, K,
+            Hcoil_func=Hcoil_func,
+            demag_only=args.demag_only
+        )
+        solver_name = "Direct"
+    elif args.solver == "compare": 
+        n = tiles.n
+        u      = tiles.u_ea
+        chi_pa = tiles.mu_r_ea - 1
+        chi_pe = tiles.mu_r_oa - 1
+        m_rem  = tiles.M_rem
+        chi = np.empty((n, 3, 3), **_F64)
+        for i in range(n):
+            uuT    = np.outer(u[i], u[i])
+            chi[i] = chi_pa[i]*uuT + chi_pe[i]*(np.eye(3) - uuT)
+        H_a = Hcoil_func(centres).astype(np.float64) if not args.demag_only else np.zeros((n, 3))
+    
+        b = construct_b(n, m_rem, u, chi, H_a)
+        A = construct_A(n, chi, demag_tensor)
+
+        tiles_sor = copy.deepcopy(tiles)
+        tiles_sor = sor_sweep(tiles_sor, centres, demag_tensor, Ms, K,
+                              omega=args.omega, max_it=args.max_it,
+                              tol=args.tol, Hcoil_func=Hcoil_func,
+                              log_every=5, demag_only=args.demag_only)
+        res_sor = norm(A @ tiles_sor.M.ravel() - b)
+        tiles_dir = copy.deepcopy(tiles)
+        tiles_dir = magstatics_direct_solve(tiles_dir, centres, demag_tensor,
+                                            Ms, K, Hcoil_func,
+                                            demag_only=args.demag_only)
+        res_dir = norm(A @ tiles_dir.M.ravel() - b) 
+
+        print(f"SOR residual    ||A·M–b||/||b|| = {res_sor:.2e}")
+        print(f"Direct residual ||A·M–b||/||b|| = {res_dir:.2e}")
+
+        tiles = tiles_dir
+        solver_name = "COMPARE"
+
     t1 = time.perf_counter()
-    print(f"\nTotal SOR iteration time: {t1-t0:.2f} s\n")
+    print(f"\nTotal {solver_name} solve time: {t1-t0:.2f} s\n")
 
     np.save(f"Intermediate/Tiles_{tag}.npy", tiles)
     print(f"→  Intermediate/Tiles_{tag}.npy written")
