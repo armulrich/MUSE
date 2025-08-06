@@ -1,9 +1,11 @@
 from pathlib import Path
+import sys
 import argparse, numpy as np
 import time
 import copy
 import magtense, magtense.magstatics as _ms
 from magtense.magstatics import get_demag_tensor, get_H_field
+import math
 from coilpy import rotation_matrix, muse2magntense
 from scipy.constants import mu_0
 from scipy.optimize import minimize
@@ -17,6 +19,10 @@ from simsopt.field import Coil, BiotSavart
 
 # LA - Directsolve Test
 import scipy.linalg as _la
+
+# Replicating tensro computation
+import numpy as np
+from numba import njit, prange
 
 ## Creating new float type
 _F64 = dict(dtype=np.float64)
@@ -232,8 +238,8 @@ def construct_b(n, m_rem, u, chi, H_a):
     return np.vstack([m_rem[i]*u[i] + chi[i] @ H_a[i] for i in range(n)]).ravel()
 
 def magstatics_direct_solve(tiles, centres, demag_tensor, ms, k, Hcoil_func, demag_only=False,krylov_tol=1e-3, krylov_it=200):
-    n      = tiles.n
-    u      = tiles.u_ea
+    n = tiles.n
+    u = tiles.u_ea
     chi_pa = tiles.mu_r_ea - 1
     chi_pe = tiles.mu_r_oa - 1
     m_rem  = tiles.M_rem
@@ -250,9 +256,7 @@ def magstatics_direct_solve(tiles, centres, demag_tensor, ms, k, Hcoil_func, dem
     sym = np.allclose(A, A.T, atol=1e-12, rtol=1e-10)
     print(f"symmetry check: {sym}")
 
-    linop = LinearOperator(A.shape, matvec=lambda v: A @ v,
-                                      rmatvec=lambda v: A.T @ v)
-
+    linop = LinearOperator(A.shape, matvec=lambda v: A @ v,rmatvec=lambda v: A.T @ v)
     if sym:
         x, info = minres(linop, b, rtol=krylov_tol, maxiter=krylov_it)
         print(f"MINRES   res  {norm(A@x-b)/norm(b):.2e}, info {info}")
@@ -260,11 +264,8 @@ def magstatics_direct_solve(tiles, centres, demag_tensor, ms, k, Hcoil_func, dem
         x, info = gmres( linop, b, rtol=krylov_tol, maxiter=krylov_it )
         print(f"GMRES    res  {norm(A@x-b)/norm(b):.2e}, info {info}")
 
-
     tiles.M = x.reshape(n, 3)
     return tiles
-
-
 
 def export_ficus_csv(tiles, fname):
     n = tiles.n
@@ -280,13 +281,287 @@ def export_ficus_csv(tiles, fname):
     out[:,12:] = tiles.M/np.linalg.norm(tiles.M,axis=1)[:,None]
     np.savetxt(fname,out,delimiter=',',header="X[m],Y[m],Z[m],n1x,n1y,n1z,n2x,n2y,n2z,H[m],L[m],M[A m],mx,my,mz")
 
+
+_INV4PI = 1.0/(4.0*math.pi)
+_MACHEPS = np.finfo(np.float64).eps
+
+@njit(inline='always')
+def f_3D(a, b, c, x, y, z):
+    half_a, half_b, half_c = a, b, c
+    eps_h, eps_l = 1.0001, 0.9999
+
+    dx = half_a - x
+    if dx == 0.0:
+        dxh, dxl = half_a - x*eps_h, half_a - x*eps_l
+        r_h = math.sqrt(dxh*dxh + (half_b - y)**2 + (half_c - z)**2)
+        r_l = math.sqrt(dxl*dxl + (half_b - y)**2 + (half_c - z)**2)
+        val_h = (half_b - y)*(half_c - z)/(dxh * r_h)
+        val_l = (half_b - y)*(half_c - z)/(dxl * r_l)
+        return 0.5*(val_h + val_l)
+    else:
+        r = math.sqrt(dx*dx + (half_b - y)**2 + (half_c - z)**2)
+        return (half_b - y)*(half_c - z)/(dx * r)
+
+@njit(inline='always')
+def g_3D(a, b, c, x, y, z):
+    half_a, half_b, half_c = a, b, c
+    eps_h, eps_l = 1.0001, 0.9999
+
+    dy = half_b - y
+    if dy == 0.0:
+        dyh, dyl = half_b - y*eps_h, half_b - y*eps_l
+        r_h = math.sqrt((half_a - x)**2 + dyh*dyh + (half_c - z)**2)
+        r_l = math.sqrt((half_a - x)**2 + dyl*dyl + (half_c - z)**2)
+        val_h = (half_a - x)*(half_c - z)/(dyh * r_h)
+        val_l = (half_a - x)*(half_c - z)/(dyl * r_l)
+        return 0.5*(val_h + val_l)
+    else:
+        r = math.sqrt((half_a - x)**2 + dy*dy + (half_c - z)**2)
+        return (half_a - x)*(half_c - z)/(dy * r)
+
+@njit(inline='always')
+def h_3D(a, b, c, x, y, z):
+    half_a, half_b, half_c = a, b, c
+    eps_h, eps_l = 1.0001, 0.9999
+
+    dz = half_c - z
+    if dz == 0.0:
+        dzh, dzl = half_c - z*eps_h, half_c - z*eps_l
+        r_h = math.sqrt((half_a - x)**2 + (half_b - y)**2 + dzh*dzh)
+        r_l = math.sqrt((half_a - x)**2 + (half_b - y)**2 + dzl*dzl)
+        val_h = (half_a - x)*(half_b - y)/(dzh * r_h)
+        val_l = (half_a - x)*(half_b - y)/(dzl * r_l)
+        return 0.5*(val_h + val_l)
+    else:
+        r = math.sqrt((half_a - x)**2 + (half_b - y)**2 + dz*dz)
+        return (half_a - x)*(half_b - y)/(dz * r)
+
+@njit(inline='always')
+def FF_3D(a, b, c, x, y, z):
+    half_a, half_b, half_c = a, b, c
+    return (half_c - z) + math.sqrt((half_a - x)**2 + (half_b - y)**2 + (half_c - z)**2)
+
+@njit(inline='always')
+def GG_3D(a, b, c, x, y, z):
+    half_a, half_b, half_c = a, b, c
+    return (half_a - x) + math.sqrt((half_a - x)**2 + (half_b - y)**2 + (half_c - z)**2)
+
+@njit(inline='always')
+def HH_3D(a, b, c, x, y, z):
+    half_a, half_b, half_c = a, b, c
+    return (half_b - y) + math.sqrt((half_a - x)**2 + (half_b - y)**2 + (half_c - z)**2)
+
+@njit(inline='always')
+def getF_limit(a, b, c, x, y, z, func):
+    lim_h, lim_l = 1.0001, 0.9999
+    xl, yl, zl = x * lim_l, y * lim_l, z * lim_l
+    xh, yh, zh = x * lim_h, y * lim_h, z * lim_h
+
+    # flip only the half-dim signs, keep coords fixed
+    nom_l = ( func( +a, +b, +c, xl, yl, zl )
+            * func( -a, -b, +c, xl, yl, zl )
+            * func( +a, -b, -c, xl, yl, zl )
+            * func( -a, +b, -c, xl, yl, zl ) )
+
+    denom_l = ( func( +a, -b, +c, xl, yl, zl )
+              * func( -a, +b, +c, xl, yl, zl )
+              * func( +a, +b, -c, xl, yl, zl )
+              * func( -a, -b, -c, xl, yl, zl ) )
+
+    nom_h = ( func( +a, +b, +c, xh, yh, zh )
+            * func( -a, -b, +c, xh, yh, zh )
+            * func( +a, -b, -c, xh, yh, zh )
+            * func( -a, +b, -c, xh, yh, zh ) )
+
+    denom_h = ( func( +a, -b, +c, xh, yh, zh )
+              * func( -a, +b, +c, xh, yh, zh )
+              * func( +a, +b, -c, xh, yh, zh )
+              * func( -a, -b, -c, xh, yh, zh ) )
+
+    return (nom_l + nom_h) / (denom_l + denom_h)
+
+@njit(cache=False)
+def _prism_N_local_nb(a, b, c, x0, y0, z0):
+    """
+    Exact 3×3 demag tensor for a prism of half-dimensions a,b,c
+    at local point (x0,y0,z0), matching the Fortran implementation 1:1.
+    """
+    N = np.empty((3,3), dtype=np.float64)
+
+    # Diagonal
+    sum_f = 0.0
+    sum_g = 0.0
+    sum_h = 0.0
+    for si in (1.0, -1.0):
+      for sj in (1.0, -1.0):
+        for sk in (1.0, -1.0):
+          xi, yi, zi = si*x0, sj*y0, sk*z0
+          sum_f += math.atan( f_3D(a,b,c, xi, yi, zi) )
+          sum_g += math.atan( g_3D(a,b,c, xi, yi, zi) )
+          sum_h += math.atan( h_3D(a,b,c, xi, yi, zi) )
+
+    N[0,0] = _INV4PI * sum_f
+    N[1,1] = _INV4PI * sum_g
+    N[2,2] = _INV4PI * sum_h
+
+    # Off-diagonals: N_xy
+    nom   = FF_3D( a,  b,  c, x0, y0, z0) \
+          * FF_3D(-a, -b,  c, x0, y0, z0) \
+          * FF_3D( a, -b, -c, x0, y0, z0) \
+          * FF_3D(-a,  b, -c, x0, y0, z0)
+
+    denom = FF_3D( a, -b,  c, x0, y0, z0) \
+          * FF_3D(-a,  b,  c, x0, y0, z0) \
+          * FF_3D( a,  b, -c, x0, y0, z0) \
+          * FF_3D(-a, -b, -c, x0, y0, z0)
+
+
+    if nom == 0.0 or denom == 0.0:
+        val = -_INV4PI * math.log( getF_limit(a,b,c,x0,y0,z0, FF_3D) )
+    else:
+        val = -_INV4PI * math.log( nom/denom )
+    # threshold to zero
+    if denom != 0.0 and abs((nom-denom)/denom) < 10.0*_MACHEPS:
+        val = 0.0
+    N[0,1] = N[1,0] = val
+
+    # N_yz
+    nom   = GG_3D( a,  b,  c, x0, y0, z0) \
+          * GG_3D(-a, -b,  c, x0, y0, z0) \
+          * GG_3D( a, -b, -c, x0, y0, z0) \
+          * GG_3D(-a,  b, -c, x0, y0, z0)
+    
+    denom = GG_3D( a, -b,  c, x0, y0, z0) \
+          * GG_3D(-a,  b,  c, x0, y0, z0) \
+          * GG_3D( a,  b, -c, x0, y0, z0) \
+          * GG_3D(-a, -b, -c, x0, y0, z0)
+    
+    if nom == 0.0 or denom == 0.0:
+        val = -_INV4PI * math.log( getF_limit(a,b,c,x0,y0,z0, GG_3D) )
+    else:
+        val = -_INV4PI * math.log( nom/denom )
+    if denom != 0.0 and abs((nom-denom)/denom) < 10.0*_MACHEPS:
+        val = 0.0
+    N[1,2] = N[2,1] = val
+
+    # N_xz
+    nom   = HH_3D( a,  b,  c, x0, y0, z0) \
+          * HH_3D(-a, -b,  c, x0, y0, z0) \
+          * HH_3D( a, -b, -c, x0, y0, z0) \
+          * HH_3D(-a,  b, -c, x0, y0, z0)
+    
+    denom = HH_3D( a, -b,  c, x0, y0, z0) \
+          * HH_3D(-a,  b,  c, x0, y0, z0) \
+          * HH_3D( a,  b, -c, x0, y0, z0) \
+          * HH_3D(-a, -b, -c, x0, y0, z0)
+
+    if nom == 0.0 or denom == 0.0:
+        val = -_INV4PI * math.log( getF_limit(a,b,c,x0,y0,z0, HH_3D) )
+    else:
+        val = -_INV4PI * math.log( nom/denom )
+    if denom != 0.0 and abs((nom-denom)/denom) < 10.0*_MACHEPS:
+        val = 0.0
+    N[0,2] = N[2,0] = val
+
+    # final sign convention
+    return -N
+
+
+def get_rotation_matrices(phi_x, phi_y, phi_z):
+    # note: Fortran uses angles = (+,) but with a preceding minus
+    #       so here we just feed in the user angles and flip signs internally:
+    ax, ay, az = -phi_x, -phi_y, -phi_z
+
+    # X–rotation
+    RotX = np.array([[1,        0,         0      ],
+                     [0, math.cos(ax), -math.sin(ax)],
+                     [0, math.sin(ax),  math.cos(ax)]])
+    # Y–rotation
+    RotY = np.array([[ math.cos(ay), 0, math.sin(ay)],
+                     [         0,    1,        0    ],
+                     [-math.sin(ay), 0, math.cos(ay)]])
+    # Z–rotation
+    RotZ = np.array([[math.cos(az), -math.sin(az), 0],
+                     [math.sin(az),  math.cos(az), 0],
+                     [      0,             0,      1]])
+
+    # exactly as in Fortran:
+    Rg2l = RotZ @ RotY @ RotX    # global → local
+    Rl2g = RotX.T @ RotY.T @ RotZ.T  # local → global
+
+    return Rg2l, Rl2g
+    
+
+@njit(parallel=True, cache=False)
+def _assemble_tensor_local_nb(centres: np.ndarray,
+                              half:    np.ndarray,
+                              Rg2l:    np.ndarray) -> np.ndarray:
+    """
+    Build full (n,n,3,3) LOCAL tensor – parallel over source tiles.
+    i.e. returns Nloc directly, without rotating back to global.
+    """
+    n = centres.shape[0]
+    Nloc_full = np.zeros((n, n, 3, 3), dtype=np.float64)
+
+    for i in prange(n):
+        a, b, c = half[i]
+        Rgl = Rg2l[i]   # global→local for tile i
+
+        for j in range(n):
+            # vector from source j to target i in global coords
+            dx = centres[i,0] - centres[j,0]
+            dy = centres[i,1] - centres[j,1]
+            dz = centres[i,2] - centres[j,2]
+
+            # rotate into local frame
+            x_loc = Rgl[0,0]*dx + Rgl[0,1]*dy + Rgl[0,2]*dz
+            y_loc = Rgl[1,0]*dx + Rgl[1,1]*dy + Rgl[1,2]*dz
+            z_loc = Rgl[2,0]*dx + Rgl[2,1]*dy + Rgl[2,2]*dz
+
+            # exact local prism tensor
+            Nloc_full[i, j] = _prism_N_local_nb(a, b, c, x_loc, y_loc, z_loc)
+    return Nloc_full
+
+
+def fast_get_demag_tensor(tiles, centres):
+    """
+    Return the LOCAL prism tensor for each i,j, exactly matching
+    the Fortran N_out(i,j,:,:) before any rotation back to global.
+    """
+    n = tiles.n
+    Rg2l = np.zeros((n, 3, 3), dtype=np.float64)
+    half = np.zeros((n, 3),     dtype=np.float64)
+
+    for k in range(n):
+        Rg2l[k], _ = get_rotation_matrices(*tiles.rot[k])
+        half[k]   = tiles.size[k] * 0.5
+
+    return _assemble_tensor_local_nb(centres.astype(np.float64), half, Rg2l)
+
+def dumb_z_align_test(tiles, centres, demag_tensor,
+                      Ms, K, Hcoil_func,
+                      demag_only=False,
+                      krylov_tol=1e-3, krylov_it=200):
+    n = tiles.n
+
+    tiles.u_ea[:] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    tiles.M = tiles.M_rem[:, None] * tiles.u_ea
+    return magstatics_direct_solve(
+        tiles, centres, demag_tensor,
+        Ms, K, Hcoil_func,
+        demag_only=demag_only,
+        krylov_tol=krylov_tol,
+        krylov_it=krylov_it
+    )
+
+    
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--muea",  type=float, default=1.00)
     ap.add_argument("--muoa",  type=float, default=1.00)
     ap.add_argument("--omega", type=float, default=0.3, help="SOR over-relaxation factor w (≈0.5–1.9)")
     ap.add_argument("--max-it",type=int,   default=100)
-    ap.add_argument("--tol",   type=float, default=1e-10)
+    ap.add_argument("--tol",   type=float, default=1e-15)
     ap.add_argument("--Hcoil", nargs=3, type=float, default=[0,0,0], metavar=("Hx","Hy","Hz"), help="Uniform coil field components A/m") 
     ap.add_argument("--use-coils",action="store_true",help="add TF-coil field with FICUS analytic model")
     ap.add_argument("--demag-only", action="store_true", help="only include H_demag (zero out H_anis and H_coil)")
@@ -308,11 +583,39 @@ def main():
 
     # Using values from one of the magtense papers (Rasmus, Roberto 2023) 
     # Link: https://backend.orbit.dtu.dk/ws/portalfiles/portal/313199195/1_s2.0_S0304885323001592_main_1_.pdf
-    Ms = np.float64(1.281e6)  # A/m  (st. μ0 Ms=1.61T)
+    Ms = np.float64(1.281e6) # A/m  (st. μ0 Ms=1.61T)
     K  = np.float64(4.3e6) # J/m³ 
 
-    #Precompute tensor
+    print("Computing MagTense tensor...")
     demag_tensor = get_demag_tensor(tiles, centres).astype(np.float64)
+    demag32 = demag_tensor.astype(np.float32)
+    np.savez_compressed(f"Intermediate/muse_tensor.npz", demag=demag32)
+
+    print("Computing in-house tensor...")
+    my_demag_tensor = fast_get_demag_tensor(tiles, centres).astype(np.float64)
+    my_demag_tensor[np.abs(my_demag_tensor) < 1e-12] = 0.0
+
+    print(tiles.use_sym[0])
+
+    print("\nMagTense  N[1,1] =\n", demag_tensor[1, 1])
+    print("In-house  N[1,1] =\n", my_demag_tensor[1, 1])
+
+    print("\nMagTense  N[5,5] =\n", demag_tensor[5, 5])
+    print("In-house  N[5,5] =\n", my_demag_tensor[5, 5])
+
+    diff      = np.abs(my_demag_tensor - demag_tensor)
+    # flatten everything down to 1D
+    ref = demag_tensor.ravel()
+    err = diff.ravel()
+    
+    # only look where the reference is “significant”
+    mask = np.abs(ref) > 1e-3   # you can tighten this threshold as you like
+    
+    rel = err[mask] / np.abs(ref[mask])
+    print("Max |ΔN|           :", err.max(), "(rms", np.sqrt(np.mean(err**2)), ")")
+    print("Max relative ΔN/N   :", rel.max(), "(rms", np.sqrt(np.mean(rel**2)), ")")
+    print(f"Over {mask.sum()} entries >1e-3 in N")
+
 
     #Loading coils...
     #intended to be used with: https://github.com/tmqian/Muse-Design-Paper/blob/main/FAMUS-files/tf-coils.focus
@@ -341,12 +644,17 @@ def main():
         )
         solver_name = "SOR"
     elif args.solver == "direct":
-        tiles = magstatics_direct_solve(
-            tiles, centres, demag_tensor,
-            Ms, K,
-            Hcoil_func=Hcoil_func,
-            demag_only=args.demag_only
-        )
+        ## test 
+        tiles = dumb_z_align_test(tiles, centres, demag_tensor, Ms, K, Hcoil_func, demag_only=args.demag_only, krylov_tol=args.tol)
+
+        ##
+        #tiles = magstatics_direct_solve(
+        #    tiles, centres, demag_tensor,
+        #    Ms, K,
+        #    Hcoil_func=Hcoil_func,
+        #    demag_only=args.demag_only,
+        #    krylov_tol=args.tol
+        #)
         solver_name = "Direct"
     elif args.solver == "compare": 
         n = tiles.n
@@ -368,12 +676,13 @@ def main():
                               omega=args.omega, max_it=args.max_it,
                               tol=args.tol, Hcoil_func=Hcoil_func,
                               log_every=5, demag_only=args.demag_only)
-        res_sor = norm(A @ tiles_sor.M.ravel() - b)
+        res_sor = norm(A @ tiles_sor.M.ravel() - b) / norm(b)
         tiles_dir = copy.deepcopy(tiles)
         tiles_dir = magstatics_direct_solve(tiles_dir, centres, demag_tensor,
                                             Ms, K, Hcoil_func,
-                                            demag_only=args.demag_only)
-        res_dir = norm(A @ tiles_dir.M.ravel() - b) 
+                                            demag_only=args.demag_only,
+                                            krylov_tol=args.tol)
+        res_dir = norm(A @ tiles_dir.M.ravel() - b) / norm(b)
 
         print(f"SOR residual    ||A·M–b||/||b|| = {res_sor:.2e}")
         print(f"Direct residual ||A·M–b||/||b|| = {res_dir:.2e}")
